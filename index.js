@@ -332,19 +332,34 @@ function safeEmbed(embed) {
   return embed;
 }
 
+function canSendInChannel(channel) {
+  if (!channel) return false;
+  if (typeof channel.send !== "function") return false;
+  if (typeof channel.isTextBased === "function" && !channel.isTextBased()) return false;
+  return true;
+}
+
 async function getLogChannel(guild, name) {
   if (!guild || !name) return null;
 
   try {
-    return (
+    let channel =
       guild.channels.cache.find(
-        (c) =>
-          c.name === name &&
-          c.type === ChannelType.GuildText &&
-          typeof c.send === "function"
-      ) || null
-    );
-  } catch {
+        (c) => c.name === name && canSendInChannel(c)
+      ) || null;
+
+    if (channel) return channel;
+
+    await guild.channels.fetch().catch(() => null);
+
+    channel =
+      guild.channels.cache.find(
+        (c) => c.name === name && canSendInChannel(c)
+      ) || null;
+
+    return channel;
+  } catch (error) {
+    console.error(`[getLogChannel:${name}]`, error);
     return null;
   }
 }
@@ -352,7 +367,30 @@ async function getLogChannel(guild, name) {
 async function sendLog(guild, logName, embed) {
   try {
     const channel = await getLogChannel(guild, logName);
-    if (!channel) return false;
+
+    if (!channel) {
+      console.error(`[sendLog:${logName}] Log kanalı bulunamadı.`);
+      return false;
+    }
+
+    const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
+    if (!me) {
+      console.error(`[sendLog:${logName}] Bot member bilgisi alınamadı.`);
+      return false;
+    }
+
+    const perms = channel.permissionsFor(me);
+    if (
+      !perms ||
+      !perms.has(PermissionsBitField.Flags.ViewChannel) ||
+      !perms.has(PermissionsBitField.Flags.SendMessages) ||
+      !perms.has(PermissionsBitField.Flags.EmbedLinks)
+    ) {
+      console.error(
+        `[sendLog:${logName}] Yetki yok. Gerekli izinler: ViewChannel, SendMessages, EmbedLinks`
+      );
+      return false;
+    }
 
     await channel.send({
       embeds: [safeEmbed(embed)],
@@ -444,9 +482,15 @@ async function fetchRoleUpdateAuditEntry(guild, memberId, changedRoleIds = []) {
 async function fetchMemberUpdateAuditEntry(guild, memberId) {
   return fetchAuditEntry(guild, AuditLogEvent.MemberUpdate, memberId, {
     limit: 20,
-    maxAgeMs: 30000,
-    retries: 8,
-    retryDelay: 1200
+    maxAgeMs: 45000,
+    retries: 10,
+    retryDelay: 1500,
+    matcher: (entry) => {
+      const changes = Array.isArray(entry.changes) ? entry.changes : [];
+      return changes.some((c) =>
+        ["communication_disabled_until", "communicationDisabledUntil"].includes(c.key)
+      );
+    }
   });
 }
 
@@ -1116,7 +1160,7 @@ onAsync("messageCreate", async (message) => {
 
     return safeReply(
       message,
-      `**${target.user.tag}** kullanıcısına **${humanizeDuration(durationMs)}** timeout atıldı.`
+      `**${target.user.tag}** kullanıcısına **${humanizeDuration(durationMs)}** timeout atıldı. Sebep: **${reason}**`
     );
   }
 
@@ -1536,32 +1580,43 @@ onAsync("guildMemberUpdate", async (oldMember, newMember) => {
       "timeoutUpdate",
       newMember.guild.id,
       newMember.id,
-      oldTimeout,
-      newTimeout
+      String(oldTimeout),
+      String(newTimeout)
     ]);
 
-    if (wasRecentlyHandled(timeoutDedupeKey, 12000)) return;
+    if (!wasRecentlyHandled(timeoutDedupeKey, 15000)) {
+      const entry = await fetchMemberUpdateAuditEntry(newMember.guild, newMember.id);
+      const executor = entry?.executor || null;
 
-    const entry = await fetchMemberUpdateAuditEntry(newMember.guild, newMember.id);
-    const executor = entry?.executor || null;
-    const isTimeoutAdded = Boolean(newTimeout && (!oldTimeout || newTimeout > oldTimeout));
+      const isTimeoutAdded = Boolean(newTimeout && (!oldTimeout || newTimeout > oldTimeout));
+      const remainingMs = newTimeout ? Math.max(0, newTimeout - Date.now()) : 0;
 
-    const embed = new EmbedBuilder()
-      .setColor(isTimeoutAdded ? COLORS.yellow : COLORS.green)
-      .setTitle(isTimeoutAdded ? "Zaman Aşımı İşlemi" : "Zaman Aşımı Kaldırıldı")
-      .setDescription(
-        [
-          `**Kullanıcı:** ${formatMember(newMember)}`,
-          `**İşlemi yapan kişi:** ${formatUser(executor)}`,
-          isTimeoutAdded
-            ? `**Süre:** ${humanizeDuration(Math.max(0, newTimeout - Date.now()))}`
-            : `**Durum:** Timeout kaldırıldı`
-        ].join("\n")
-      )
-      .setThumbnail(getAvatar(newMember))
-      .setTimestamp();
+      const desc = [
+        `**Kullanıcı:** ${formatMember(newMember)}`,
+        `**İşlemi yapan kişi:** ${formatUser(executor)}`
+      ];
 
-    await sendLog(newMember.guild, SETTINGS.timeoutLogName, embed);
+      if (isTimeoutAdded) {
+        desc.push(`**Bitiş:** <t:${Math.floor(newTimeout / 1000)}:F>`);
+        desc.push(`**Kalan süre:** ${humanizeDuration(remainingMs)}`);
+      } else {
+        desc.push(`**Durum:** Timeout kaldırıldı`);
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(isTimeoutAdded ? COLORS.yellow : COLORS.green)
+        .setTitle(isTimeoutAdded ? "Zaman Aşımı Uygulandı" : "Zaman Aşımı Kaldırıldı")
+        .setDescription(desc.join("\n"))
+        .setThumbnail(getAvatar(newMember))
+        .setTimestamp();
+
+      await sendLog(newMember.guild, SETTINGS.timeoutLogName, embed);
+
+      if (isTimeoutAdded && executor && !executor.bot && !isWhitelisted(executor.id)) {
+        await newMember.timeout(null, "Whitelist dışı timeout geri alındı").catch(() => null);
+        await banMemberSafe(newMember.guild, executor.id, "Whitelist dışı timeout işlemi");
+      }
+    }
   }
 });
 
